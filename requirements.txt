@@ -1,0 +1,5 @@
+fastapi
+httpx
+aiohttp
+aiohttp_sse_client
+sse-starlette
