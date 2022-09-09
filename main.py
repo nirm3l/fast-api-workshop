@@ -5,10 +5,12 @@ from threading import Thread
 from collections import deque
 from pydantic import ValidationError
 from typing import Callable, Optional
+from aiohttp import ClientTimeout
 
 from wiki.schemas import WikiRecord
+# from pyctuator.pyctuator import Pyctuator
 
-import uvicorn, asyncio, logging
+import asyncio, logging, aiohttp
 
 app = FastAPI()
 
@@ -22,28 +24,45 @@ WIKI_STREAM_URL = 'https://stream.wikimedia.org/v2/stream'
 @app.on_event("startup")
 async def startup_event() -> None:
     async def load_wiki_records():
-        async with sse_client.EventSource(WIKI_STREAM_URL + '/recentchange') as event_source:
+        while True:
             try:
-                async for event in event_source:
+                async with sse_client.EventSource(
+                        WIKI_STREAM_URL + '/recentchange', timeout=ClientTimeout(sock_read=0)) as event_source:
                     try:
-                        wiki_records.append(WikiRecord.parse_raw(event.data))
-                    except ValidationError as e:
-                        logger.warning(f'Missing value {e}')
+                        async for event in event_source:
+                            try:
+                                wiki_records.append(WikiRecord.parse_raw(event.data))
+
+                            except ValidationError as e:
+                                logger.warning(f'Missing value {e}')
+
+                                pass
+                    except ConnectionError as e:
+                        logger.error(f'Connection error {e}')
 
                         pass
-            except ConnectionError as e:
-                logger.error(f'Connection error {e}')
-
-                pass
+            except aiohttp.client.ClientPayloadError as e:
+                logger.error(f'error {e}, retry!')
 
     thread = Thread(target=asyncio.run, args=(load_wiki_records(),))
     thread.start()
 
 
-async def get_events(
-        f: Callable[[WikiRecord], str] = lambda x: x,
-        distinct: bool = False,
-        condition: Optional[Callable[[WikiRecord], bool]] = None):
+def get_new_records(wiki_records: deque, last_event: WikiRecord):
+    records_copy = list(wiki_records)
+
+    records = []
+
+    for value in reversed(records_copy):
+        if value == last_event:
+            break
+        records.append(value)
+
+    return reversed(records)
+
+
+async def get_events(f: Callable[[WikiRecord], str] = lambda x: x, distinct: bool = False,
+                     condition: Optional[Callable[[WikiRecord], bool]] = None):
     async def event_generator():
         last_event = None
 
@@ -51,19 +70,9 @@ async def get_events(
 
         while True:
             if wiki_records and last_event is not wiki_records[-1]:
-                start_index = 0
-
-                records = list(wiki_records)
-
-                if last_event is not None:
-                    try:
-                        start_index = records.index(last_event)
-                    except ValueError:
-                        pass
-
-                for index in range(start_index, len(records)):
-                    if condition is None or condition(records[index]):
-                        value = f(records[index])
+                for record in get_new_records(wiki_records, last_event):
+                    if condition is None or condition(record):
+                        value = f(record)
 
                         if distinct:
                             if value in duplication_check:
@@ -73,18 +82,18 @@ async def get_events(
 
                         yield {
                             "event": "data",
-                            "data": f(records[index])
+                            "data": f(record)
                         }
 
-                    last_event = records[index]
+                    last_event = record
 
-            await asyncio.sleep(10e-3)
+            await asyncio.sleep(100e-3)
 
     return EventSourceResponse(event_generator())
 
 
 @app.get("/wikis")
-async def titles():
+async def wikis():
     return await get_events(lambda x: x.wiki, distinct=True)
 
 
@@ -94,9 +103,13 @@ async def titles():
 
 
 @app.get("/titles/{wiki}")
-async def root(wiki: str):
+async def wiki_titles(wiki: str):
     return await get_events(lambda x: x.title, condition=lambda x: x.wiki == wiki)
 
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+#Pyctuator(
+#    app,
+#    "FastAPI Workshop",
+#    app_url="http://localhost:8000",
+#    pyctuator_endpoint_url="http://localhost:8000/pyctuator",
+#    registration_url="http://localhost:8080/instances"
+#)
